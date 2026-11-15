@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 import Security
 
 // MARK: - 设置（UserDefaults）
@@ -167,6 +168,8 @@ final class SyncEngine: ObservableObject {
     @Published var preview: (copies: Int, deletes: Int, conflicts: Int) = (0, 0, 0)
     @Published var conflictFiles: [String] = []
     @Published var lastLog = ""
+    @Published var changes: [FileChange] = []   // 本次每个文件的新增/修改/删除
+    @Published var toast: Toast?
     @Published var needsSetup = false   // 只有缺密码/找不到 remote 时才把用户带去设置
 
     static let checkFile = "RCLONE_TEST"
@@ -205,7 +208,7 @@ final class SyncEngine: ObservableObject {
 
     /// 第一步：确保两边都有标记文件，再 dry-run 预览
     func startPreview() {
-        phase = .previewing; status = "正在检查变化…"; progress = 0; detail = ""
+        phase = .previewing; status = "正在检查变化…"; progress = 0; detail = ""; changes = []
         Task {
             // 傻瓜式：自动挑 remote、自动建两边目录，只有缺密码才打断用户
             if Settings.remote.isEmpty {
@@ -245,9 +248,18 @@ final class SyncEngine: ObservableObject {
             }
             lastLog = r.output
             if r.code != 0 { forceDeletes = false; fail(r.output); return }
+            var list: [FileChange] = []
+            for l in r.output.split(separator: "\n") { ChangeParser.apply(String(l), to: &list) }
+            changes = list.map { var c = $0; c.done = false; return c }
+            if !changes.isEmpty {
+                conflicts = changes.filter { $0.kind == .conflict }.count
+                deletes = changes.filter { $0.kind == .deleted }.count
+                copies = changes.count - deletes
+            }
             preview = (copies, deletes, conflicts)
             if copies == 0 && deletes == 0 {
                 phase = .done; status = "两边已一致"; Settings.lastSync = Date()
+                show(Toast(icon: "checkmark.seal.fill", color: .green, title: "两边已经一致", subtitle: "没有需要同步的文件"))
                 if needsResync { await runReal() }   // 基线还没建立的话照样建
             } else {
                 phase = .awaitingConfirm
@@ -264,10 +276,11 @@ final class SyncEngine: ObservableObject {
         let resync = needsResync
         phase = .syncing; status = resync ? "正在建立同步基线…" : "正在同步…"; progress = 0
         let r = await Rclone.run(bisyncArgs(dryRun: false, resync: resync)) { [weak self] line in
-            guard let s = Self.stats(of: line) else { return }
+            let s = Self.stats(of: line)
             Task { @MainActor in
-                self?.progress = s.0
-                self?.detail = s.1
+                guard let self else { return }
+                if let s { self.progress = s.0; self.detail = s.1; return }
+                withAnimation(.spring(duration: 0.35)) { ChangeParser.apply(line, to: &self.changes) }
             }
         }
         lastLog = r.output
@@ -279,11 +292,37 @@ final class SyncEngine: ObservableObject {
         scanConflicts()
         phase = .done
         status = conflictFiles.isEmpty ? "同步完成" : "同步完成，有 \(conflictFiles.count) 个冲突副本"
+        detail = ""
+        for i in changes.indices { changes[i].done = true }
+        show(Toast(icon: conflictFiles.isEmpty ? "checkmark.circle.fill" : "exclamationmark.triangle.fill",
+                   color: conflictFiles.isEmpty ? .green : .orange,
+                   title: changes.isEmpty ? "同步完成" : "已同步 \(changes.count) 个文件",
+                   subtitle: summary))
+    }
+
+    /// "新增 2 · 修改 1 · 删除 1"
+    var summary: String {
+        let parts: [(FileChange.Kind, String)] = [(.new, "新增"), (.modified, "修改"), (.deleted, "删除→回收区"), (.conflict, "冲突")]
+        return parts.compactMap { k, t in
+            let n = changes.filter { $0.kind == k }.count
+            return n > 0 ? "\(t) \(n)" : nil
+        }.joined(separator: " · ")
+    }
+
+    private var toastTask: Task<Void, Never>?
+    func show(_ t: Toast) {
+        withAnimation(.spring(duration: 0.45, bounce: 0.3)) { toast = t }
+        toastTask?.cancel()
+        toastTask = Task {
+            try? await Task.sleep(for: .seconds(4.5))
+            if !Task.isCancelled { withAnimation(.easeInOut(duration: 0.3)) { toast = nil } }
+        }
     }
 
     private func fail(_ out: String) {
         forceDeletes = false
         phase = .failed
+        defer { show(Toast(icon: "xmark.octagon.fill", color: .red, title: status, subtitle: "同步已中止，点「日志」看原因")) }
         let low = out.lowercased()
         if low.contains("too many deletes") || low.contains("max-delete") {
             status = "删除超过 10%，已自动中止"

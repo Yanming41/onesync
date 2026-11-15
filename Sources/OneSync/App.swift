@@ -80,6 +80,19 @@ struct GlassWindow: NSViewRepresentable {
             w.isOpaque = false
             w.backgroundColor = .clear
             w.titlebarAppearsTransparent = true
+            w.titleVisibility = .hidden
+            w.styleMask.insert(.fullSizeContentView)   // 内容铺到标题栏下面，去掉那块灰框
+            w.titlebarSeparatorStyle = .none
+            w.toolbar = nil
+            w.hasShadow = false                        // 窗口矩形的阴影/边框也不要，只留面板自己的
+            if let frameView = w.contentView?.superview {
+                frameView.wantsLayer = true
+                frameView.layer?.backgroundColor = NSColor.clear.cgColor
+            }
+            // 红绿灯挪进面板左上角
+            if let close = w.standardWindowButton(.closeButton) {
+                close.setFrameOrigin(NSPoint(x: 18, y: close.frame.origin.y - 8))
+            }
             w.isMovableByWindowBackground = true
             w.level = .floating
             w.standardWindowButton(.miniaturizeButton)?.isHidden = true
@@ -131,6 +144,7 @@ struct RootView: View {
         PanelView(showSettings: $showSettings)
             .panelGlass(s)
             .background(GlassWindow(style: s))
+            .ignoresSafeArea()
             .preferredColorScheme(colorMode == "light" ? .light : colorMode == "dark" ? .dark : nil)
             .id(style + colorMode)   // 切换风格时整体重建
     }
@@ -142,6 +156,7 @@ struct PanelView: View {
     @EnvironmentObject var e: SyncEngine
     @Binding var showSettings: Bool
     @State private var showLog = false
+    @State private var showChanges = false
 
     var body: some View {
         ZStack {
@@ -169,17 +184,25 @@ struct PanelView: View {
             SyncButton().padding(.vertical, 6)
 
             Text(e.status).font(.system(size: 16, weight: .medium)).multilineTextAlignment(.center)
+                .contentTransition(.interpolate)
+                .id(e.status).transition(.asymmetric(insertion: .move(edge: .bottom).combined(with: .opacity), removal: .opacity))
 
             if e.phase == .syncing {
                 ProgressView(value: e.progress).progressViewStyle(.linear).tint(.blue)
+                    .transition(.scale(scale: 0.9).combined(with: .opacity))
             }
             if !e.detail.isEmpty {
                 Text(e.detail).font(.callout).foregroundStyle(Color.primary.opacity(0.72)).multilineTextAlignment(.center).lineLimit(4)
+                    .contentTransition(.numericText())
             }
 
-            if e.phase == .awaitingConfirm { confirmCard }
+            if e.phase == .awaitingConfirm { confirmCard.transition(.card) }
+            if e.phase == .syncing && !e.changes.isEmpty {
+                ChangeList(list: e.changes, showDone: true).padding(8).glassCard().transition(.card)
+            }
+            if e.phase == .done && !e.changes.isEmpty { doneCard.transition(.card) }
 
-            if !e.conflictFiles.isEmpty { conflictCard }
+            if !e.conflictFiles.isEmpty { conflictCard.transition(.card) }
 
             HStack {
                 Text(lastText).font(.footnote).foregroundStyle(Color.primary.opacity(0.6))
@@ -197,18 +220,52 @@ struct PanelView: View {
             }
         }
         .padding(.horizontal, 18).padding(.bottom, 18).padding(.top, 30)
+        .animation(.spring(duration: 0.45, bounce: 0.2), value: e.phase)
+        .animation(.spring(duration: 0.35), value: e.status)
+        .animation(.spring(duration: 0.35), value: showChanges)
+        .animation(.spring(duration: 0.35), value: showLog)
+        .overlay(alignment: .top) {
+            if let t = e.toast {
+                ToastView(t: t)
+                    .padding(.horizontal, 14).padding(.top, 8)
+                    .transition(.move(edge: .top).combined(with: .opacity).combined(with: .scale(scale: 0.9, anchor: .top)))
+                    .onTapGesture { withAnimation(.easeInOut(duration: 0.25)) { e.toast = nil } }
+            }
+        }
+    }
+
+    var doneCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button { showChanges.toggle() } label: {
+                HStack {
+                    ChangeChips(list: e.changes)
+                    Spacer()
+                    Image(systemName: "chevron.down").font(.caption.weight(.semibold))
+                        .rotationEffect(.degrees(showChanges ? 180 : 0))
+                }.contentShape(Rectangle())
+            }.buttonStyle(.plain)
+            if showChanges {
+                ChangeList(list: e.changes, showDone: true).transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .padding(10).glassCard()
     }
 
     var confirmCard: some View {
         VStack(spacing: 10) {
-            HStack(spacing: 18) {
-                stat("\(e.preview.copies)", "传输", "arrow.up.arrow.down")
-                stat("\(e.preview.deletes)", "删除→回收区", "trash")
-                stat("\(e.preview.conflicts)", "冲突", "exclamationmark.triangle")
+            if e.changes.isEmpty {
+                HStack(spacing: 18) {
+                    stat("\(e.preview.copies)", "传输", "arrow.up.arrow.down")
+                    stat("\(e.preview.deletes)", "删除→回收区", "trash")
+                    stat("\(e.preview.conflicts)", "冲突", "exclamationmark.triangle")
+                }
+            } else {
+                ChangeChips(list: e.changes).frame(maxWidth: .infinity, alignment: .leading)
+                ChangeList(list: e.changes)
             }
             HStack {
                 Button("取消") { e.cancel() }.buttonStyle(.bordered)
-                Button("开始同步") { e.confirm() }.buttonStyle(.borderedProminent)
+                Button("开始同步") { e.confirm() }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
             }.controlSize(.regular)
         }
         .padding(12).glassCard()
@@ -265,13 +322,15 @@ struct SyncButton: View {
                 }
                 Image(systemName: icon)
                     .font(.system(size: 42, weight: .medium))
+                    .contentTransition(.symbolEffect(.replace.downUp))
+                    .symbolEffect(.bounce, value: e.phase == .done)
                     .foregroundStyle(e.phase == .failed ? AnyShapeStyle(.orange) : AnyShapeStyle(.blue.gradient))
                     .rotationEffect(.degrees(busy && spin ? 360 : 0))
                     .animation(busy ? .linear(duration: 1.2).repeatForever(autoreverses: false) : .default, value: spin)
             }
             .frame(width: 124, height: 124)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressableStyle())
         .disabled(busy || e.phase == .awaitingConfirm)
         .onChange(of: busy) { _, b in spin = b }
     }
@@ -296,10 +355,24 @@ struct SettingsView: View {
     @State private var remotePath = Settings.remotePath
     @State private var msg = ""
     @State private var pwMsg = ""
+    @State private var browsing = false
     @AppStorage("glassStyle") var style = GlassStyle.liquid.rawValue
     @AppStorage("colorMode") var colorMode = "light"
 
     var body: some View {
+        ZStack {
+            if browsing {
+                FolderBrowser(remote: remote, selection: $remotePath) {
+                    withAnimation(.spring(duration: 0.45, bounce: 0.2)) { browsing = false }
+                }
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+            } else {
+                form.transition(.move(edge: .leading).combined(with: .opacity))
+            }
+        }
+    }
+
+    var form: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("设置").font(.system(size: 19, weight: .semibold))
 
@@ -340,8 +413,25 @@ struct SettingsView: View {
                 }.labelsHidden().pickerStyle(.segmented)
             }
 
-            group("OneDrive 目录（不能是根目录）") {
-                TextField("例如 Documents/Mac", text: $remotePath).textFieldStyle(.roundedBorder)
+            group("OneDrive 目录") {
+                Button {
+                    withAnimation(.spring(duration: 0.45, bounce: 0.2)) { browsing = true }
+                } label: {
+                    HStack(spacing: 10) {
+                        FolderIcon(name: remotePath.split(separator: "/").last.map(String.init) ?? "OneSync", size: 34)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(remotePath.split(separator: "/").last.map(String.init) ?? "未选择").font(.body.weight(.medium))
+                            Text("OneDrive/\(remotePath)").font(.caption).foregroundStyle(Color.primary.opacity(0.6)).lineLimit(1).truncationMode(.middle)
+                        }
+                        Spacer()
+                        Text("浏览").font(.callout)
+                        Image(systemName: "chevron.right").font(.caption.weight(.semibold))
+                    }
+                    .foregroundStyle(Color.primary)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(PressableStyle())
+                .disabled(remotes.isEmpty)
             }
 
             Text("改目录后，下次同步会先只合并、不删除，重新建立基线。").font(.footnote).foregroundStyle(Color.primary.opacity(0.72))
@@ -411,3 +501,11 @@ struct SettingsView: View {
     }
 }
 
+
+extension AnyTransition {
+    /// 卡片出现：从上方轻轻落下 + 渐显；消失：缩小渐隐
+    static var card: AnyTransition {
+        .asymmetric(insertion: .move(edge: .top).combined(with: .opacity).combined(with: .scale(scale: 0.96, anchor: .top)),
+                    removal: .opacity.combined(with: .scale(scale: 0.96)))
+    }
+}
